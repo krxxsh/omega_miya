@@ -1,0 +1,32 @@
+# === Model Files (too large for GitHub) ===
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+Modelfile
+
+# === Node.js ===
+node_modules/
+dist/
+*.log
+
+# === Python ===
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+*.swp
+
+# === IDE ===
+.vscode/
+.idea/
+
+# === Build ===
+build/
+out/
