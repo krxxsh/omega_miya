@@ -1,4 +1,30 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, memo } from 'react';
+
+// Memoized individual message to avoid re-rendering all messages during streaming
+const ChatMessage = memo(function ChatMessage({ msg }) {
+    const formattedTime = React.useMemo(
+        () => new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        [msg.timestamp]
+    );
+
+    return (
+        <div className={`chat-message ${msg.role}`}>
+            <div className="message-content">{msg.content}</div>
+            <div className="message-footer">
+                <span className="timestamp">{formattedTime}</span>
+                {msg.role === 'assistant' && (
+                    <button
+                        className="message-action"
+                        onClick={() => navigator.clipboard?.writeText(msg.content)}
+                        title="Copy"
+                    >
+                        📋
+                    </button>
+                )}
+            </div>
+        </div>
+    );
+});
 
 export default function ChatPanel({ messages, isTyping }) {
     const containerRef = useRef(null);
@@ -8,7 +34,7 @@ export default function ChatPanel({ messages, isTyping }) {
             if (containerRef.current) {
                 containerRef.current.scrollTop = containerRef.current.scrollHeight;
             }
-        }, 50); // Tiny delay for DOM updates
+        }, 50);
         return () => clearTimeout(timer);
     }, [messages, isTyping]);
 
@@ -29,26 +55,7 @@ export default function ChatPanel({ messages, isTyping }) {
     return (
         <div className="chat-panel" ref={containerRef}>
             {messages.map((msg, i) => (
-                <div key={i} className={`chat-message ${msg.role}`}>
-                    <div className="message-content">{msg.content}</div>
-                    <div className="message-footer">
-                        <span className="timestamp">
-                            {new Date(msg.timestamp).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                            })}
-                        </span>
-                        {msg.role === 'assistant' && (
-                            <button
-                                className="message-action"
-                                onClick={() => navigator.clipboard?.writeText(msg.content)}
-                                title="Copy"
-                            >
-                                📋
-                            </button>
-                        )}
-                    </div>
-                </div>
+                <ChatMessage key={msg.id || msg.timestamp || i} msg={msg} />
             ))}
 
             {/* Typing indicator */}
@@ -61,8 +68,6 @@ export default function ChatPanel({ messages, isTyping }) {
                     </div>
                 </div>
             )}
-
-            {/* Scroll bottom anchor */}
         </div>
     );
 }

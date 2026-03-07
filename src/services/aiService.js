@@ -3,7 +3,6 @@
  * Uses Groq API (FREE tier, lightning fast)
  */
 
-import Anthropic from '@anthropic-ai/sdk';
 import { TOOL_DEFINITIONS, executeCommand } from './commandService';
 import { getMemoryContext, saveMemory, searchMemories } from './memoryService';
 import { sendToLocalBrain } from './localBrainService';
@@ -16,7 +15,36 @@ Tools:
 - Files: "clean_desktop", "convert_file".
 - Vision: "describe_screen".
 - PC: "execute_terminal".
-Personality: Ultra-lean, 1-sentence confirm. No chatter.`;
+Personality: Ultra-lean, 1-sentence confirm. No chatter. 
+Coding: When asked to write code, act as a world-class Senior Developer. Provide mathematically accurate, highly optimized, bug-free, and logical code. Do not hallucinate syntax.`;
+
+const CONTEXT_WINDOW_SIZE = 6; // Keep last N messages verbatim
+
+/**
+ * Sliding context window — keeps recent messages, summarizes older ones
+ * This dramatically reduces tokens sent to the LLM
+ */
+function buildContextWindow(messages) {
+    if (messages.length <= CONTEXT_WINDOW_SIZE) return messages;
+
+    const recentMessages = messages.slice(-CONTEXT_WINDOW_SIZE);
+    const olderMessages = messages.slice(0, -CONTEXT_WINDOW_SIZE);
+
+    // Compress older messages into a single recap
+    const recap = olderMessages.map(m => {
+        const prefix = m.role === 'user' ? 'User' : 'Miya';
+        // Truncate long messages to ~60 chars
+        const short = m.content.length > 60 ? m.content.slice(0, 57) + '...' : m.content;
+        return `${prefix}: ${short}`;
+    }).join(' | ');
+
+    const summaryMsg = {
+        role: 'system',
+        content: `[Earlier conversation recap: ${recap}]`
+    };
+
+    return [summaryMsg, ...recentMessages];
+}
 
 
 
@@ -28,9 +56,22 @@ function sanitizeResponse(text) {
     clean = clean.replace(/control_media=\{.*?\}[\s\S]*?(<\/function>|$)/gi, '');
     clean = clean.replace(/\{"action":.*?\}[\s\S]*?(<\/function>|$)/gi, '');
     clean = clean.replace(/<\/function>/gi, '');
-    clean = clean.replace(/```json[\s\S]*?```/gi, '');
+    clean = clean.replace(/```json[\s\S]*? ```/gi, '');
     clean = clean.replace(/<.*?>/gi, ''); // Any remaining XML-like tags
+
+    // Strip out Alpaca/Llama raw prompt bleeding
+    clean = clean.replace(/### Instruction:(.*?)### Response:/gis, '').trim();
+    clean = clean.replace(/### Response:/gi, '').trim();
+    clean = clean.replace(/### Instruction:/gi, '').trim();
+
     // Remove repetitive prefixes
+    const prefixes = ['Miya:', 'System:', 'Assistant:'];
+    for (const p of prefixes) {
+        if (clean.startsWith(p)) {
+            clean = clean.replace(p, '').trim();
+        }
+    }
+
     clean = clean.replace(/^(SUCCESS|Confirmed|Done|Ready)\.?\s*/i, '');
     return clean.trim() || "Action completed.";
 }
@@ -46,18 +87,94 @@ function toAnthropicTools(tools) {
     }));
 }
 
-export async function sendMessage(messages, apiKey) {
+// Cache at module level — tool defs are static
+const ANTHROPIC_TOOLS = toAnthropicTools(TOOL_DEFINITIONS);
+
+/**
+ * Super-fast local intent router. Avoids LLM calls for basic queries.
+ * Returns the response string if handled, or null to fall back to LLM.
+ */
+function routeLocalIntent(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+
+    // Time/Date queries
+    if (/what time is it|what's the time|current time/.test(lower) ||
+        /what day is it|what's the date|current date/.test(lower)) {
+        const now = new Date();
+        const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const date = now.toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        return `It is currently ${time} on ${date}.`;
+    }
+
+    // Open common apps
+    const openAppMatch = lower.match(/(?:open|launch|start|run)\s+(chrome|notepad|calculator|spotify|code|settings|youtube)/);
+    if (openAppMatch) {
+        executeCommand('open_app', { app_name: openAppMatch[1] });
+        return `Opening ${openAppMatch[1]}...`;
+    }
+
+    // Open websites
+    const openWebMatch = lower.match(/(?:open|go to) (youtube|google|github|reddit|twitter)\.com/);
+    if (openWebMatch) {
+        executeCommand('open_website', { url: `https://www.${openWebMatch[1]}.com` });
+        return `Opening ${openWebMatch[1]}.com...`;
+    }
+
+    // Media controls
+    if (lower.includes('pause') || lower.includes('play music') || lower.includes('play media')) {
+        executeCommand('control_media', { action: 'play_pause' });
+        return "Toggled media playback.";
+    }
+    if (lower.includes('next track') || lower.includes('skip song') || lower.includes('next song')) {
+        executeCommand('control_media', { action: 'next' });
+        return "Skipped to the next track.";
+    }
+    if (lower.includes('previous track') || lower.includes('previous song')) {
+        executeCommand('control_media', { action: 'prev' });
+        return "Going back to the previous track.";
+    }
+    if (lower.includes('volume up') || lower.includes('louder')) {
+        executeCommand('control_media', { action: 'vol_up' });
+        return "Increased volume.";
+    }
+    if (lower.includes('volume down') || lower.includes('quieter') || lower.includes('softer')) {
+        executeCommand('control_media', { action: 'vol_down' });
+        return "Decreased volume.";
+    }
+
+    return null; // Let the LLM handle it
+}
+
+export async function sendMessage(messages, apiKey, onToken = null, abortSignal = null) {
     if (!apiKey) {
         throw new Error('API key not set. Please configure your API key in settings.');
     }
 
-    const memoryContext = getMemoryContext();
+    const lastUserMsg = messages[messages.length - 1]?.content || '';
+
+    // 🚀 Fast Local Intent Router (Sub-10ms response)
+    const intentResult = routeLocalIntent(lastUserMsg);
+    if (intentResult) {
+        await sleep(150); // Tiny artificial delay to feel natural
+        if (onToken) onToken(intentResult);
+        return intentResult;
+    }
+
+    const memoryContext = getMemoryContext(lastUserMsg);
     const fullSystemPrompt = SYSTEM_PROMPT + memoryContext;
+
+    // Apply sliding context window
+    const windowedMessages = buildContextWindow(messages);
 
     // Handle Local Brain Bypass
     const normalizedKey = apiKey.trim().toUpperCase();
     if (normalizedKey === 'LOCAL_BRAIN') {
-        const response = await sendToLocalBrain(messages);
+        const localMessages = [
+            { role: 'system', content: fullSystemPrompt },
+            ...windowedMessages
+        ];
+        const response = await sendToLocalBrain(localMessages, onToken, undefined, abortSignal);
         return sanitizeResponse(response);
     }
 
@@ -68,13 +185,13 @@ export async function sendMessage(messages, apiKey) {
     const isAnthropic = apiKey.startsWith('sk-ant');
 
     if (isAnthropic) {
-        return sendToClaude(messages, apiKey, fullSystemPrompt);
+        return sendToClaude(windowedMessages, apiKey, fullSystemPrompt, abortSignal);
     } else {
-        return sendToGroq(messages, apiKey, fullSystemPrompt);
+        return sendToGroq(windowedMessages, apiKey, fullSystemPrompt, abortSignal);
     }
 }
 
-async function sendToClaude(messages, apiKey, systemPrompt) {
+async function sendToClaude(messages, apiKey, systemPrompt, abortSignal = null) {
     const formatMessagesForClaude = messages.map(m => {
         if (m.role === 'system') return null;
         return { role: m.role, content: m.content || ' ' };
@@ -83,6 +200,7 @@ async function sendToClaude(messages, apiKey, systemPrompt) {
     try {
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
+            signal: abortSignal,
             headers: {
                 'Content-Type': 'application/json',
                 'x-api-key': apiKey,
@@ -93,7 +211,7 @@ async function sendToClaude(messages, apiKey, systemPrompt) {
                 model: 'claude-3-5-sonnet-20241022',
                 system: systemPrompt,
                 messages: formatMessagesForClaude,
-                tools: toAnthropicTools(TOOL_DEFINITIONS),
+                tools: ANTHROPIC_TOOLS,
                 max_tokens: 500,
                 temperature: 0.7,
             }),
@@ -162,12 +280,13 @@ async function sendToClaude(messages, apiKey, systemPrompt) {
                         content: [{ type: 'tool_result', tool_use_id: toolCall.id, content: toolContent }]
                     }
                 ],
-                tools: toAnthropicTools(TOOL_DEFINITIONS),
+                tools: ANTHROPIC_TOOLS,
                 max_tokens: 1000, // Increase for vision analysis
             };
 
             const followUp = await fetch('https://api.anthropic.com/v1/messages', {
                 method: 'POST',
+                signal: abortSignal,
                 headers: {
                     'Content-Type': 'application/json',
                     'x-api-key': apiKey,
@@ -191,7 +310,7 @@ async function sendToClaude(messages, apiKey, systemPrompt) {
     }
 }
 
-async function sendToGroq(messages, apiKey, systemPrompt) {
+async function sendToGroq(messages, apiKey, systemPrompt, abortSignal = null) {
     const formattedMessages = [
         { role: 'system', content: systemPrompt },
         ...messages.map(m => ({ role: m.role, content: m.content }))
@@ -204,12 +323,15 @@ async function sendToGroq(messages, apiKey, systemPrompt) {
             tools: TOOL_DEFINITIONS,
             tool_choice: 'auto',
             temperature: 0.7,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.3,
             max_completion_tokens: 500,
         };
         if (bodyOverride) body.model = modelName;
 
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
+            signal: abortSignal,
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
             body: JSON.stringify(body),
         });

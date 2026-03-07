@@ -1,26 +1,33 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell, globalShortcut, Notification, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
+const os = require('os');
 
 // Define store using local file to avoid ESM/CJS versioning issues
 const configPath = path.join(app.getPath('userData'), 'config.json');
-const getStore = (key, defaultValue) => {
+let _configCache = null;
+
+function _loadConfig() {
+    if (_configCache) return _configCache;
     try {
-        if (!fs.existsSync(configPath)) return defaultValue;
-        const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        return data[key] !== undefined ? data[key] : defaultValue;
+        if (!fs.existsSync(configPath)) { _configCache = {}; return _configCache; }
+        _configCache = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     } catch (e) {
-        return defaultValue;
+        _configCache = {};
     }
+    return _configCache;
+}
+
+const getStore = (key, defaultValue) => {
+    const data = _loadConfig();
+    return data[key] !== undefined ? data[key] : defaultValue;
 };
 const setStore = (key, value) => {
     try {
-        let data = {};
-        if (fs.existsSync(configPath)) {
-            data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        }
+        const data = _loadConfig();
         data[key] = value;
+        _configCache = data;
         fs.writeFileSync(configPath, JSON.stringify(data, null, 2));
     } catch (e) {
         console.error('Error saving to store:', e);
@@ -33,6 +40,7 @@ const isDev = !app.isPackaged;
 
 // User's Desktop path for file creation
 const DESKTOP_PATH = app.getPath('desktop');
+const HOME_DIR = os.homedir();
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -159,10 +167,10 @@ ipcMain.handle('open-app', (_, appName) => {
         'settings': 'start ms-settings:',
         'task manager': 'start taskmgr',
         // Common Folders
-        'desktop': `start "" "${require('os').homedir()}\\Desktop"`,
-        'documents': `start "" "${require('os').homedir()}\\Documents"`,
-        'downloads': `start "" "${require('os').homedir()}\\Downloads"`,
-        'pictures': `start "" "${require('os').homedir()}\\Pictures"`,
+        'desktop': `start "" "${HOME_DIR}\\Desktop"`,
+        'documents': `start "" "${HOME_DIR}\\Documents"`,
+        'downloads': `start "" "${HOME_DIR}\\Downloads"`,
+        'pictures': `start "" "${HOME_DIR}\\Pictures"`,
     };
 
     if (appCommands[name]) {
@@ -192,7 +200,6 @@ ipcMain.handle('open-app', (_, appName) => {
         }
     `;
 
-    const { spawn } = require('child_process');
     const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-']);
 
     let output = '';
@@ -242,8 +249,6 @@ ipcMain.handle('create-folder', (_, folderName) => {
 // Execute arbitrary terminal commands (Agentic Control)
 ipcMain.handle('execute-terminal', async (_, command) => {
     return new Promise((resolve) => {
-        const { exec } = require('child_process');
-        // Run in PowerShell, from the Desktop directory by default
         exec(`powershell -Command "${command.replace(/"/g, '\\"')}"`, { cwd: DESKTOP_PATH }, (error, stdout, stderr) => {
             if (error) {
                 console.error(`Terminal error:`, error);
@@ -303,7 +308,6 @@ ipcMain.handle('convert-docx-to-pdf', async (_, sourcePath) => {
         `;
 
         return new Promise((resolve) => {
-            const { spawn } = require('child_process');
             const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-']);
 
             let output = '';
@@ -393,7 +397,6 @@ ipcMain.handle('control-media', async (_, args) => {
         `;
 
         return new Promise((resolve) => {
-            const { spawn } = require('child_process');
             const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-']);
             let output = '';
             child.stdout.on('data', d => output += d.toString());
@@ -409,7 +412,6 @@ ipcMain.handle('control-media', async (_, args) => {
     if (!key) return `Error: Unknown action ${action}`;
 
     return new Promise((resolve) => {
-        const { spawn } = require('child_process');
         const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(New-Object -ComObject WScript.Shell).SendKeys([char]${key})`]);
         child.on('close', () => resolve(`Media action '${action}' executed.`));
     });

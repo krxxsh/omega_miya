@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Avatar from './components/Avatar';
 import ChatPanel from './components/ChatPanel';
 import VoiceControls from './components/VoiceControls';
@@ -11,9 +11,18 @@ import { sendMessage } from './services/aiService';
 import { analyzeSentiment, moodToEmotion } from './services/sentimentAnalysis';
 import { extractAndSaveFacts } from './services/memoryService';
 import { requestNotificationPermission } from './services/commandService';
+import { warmModel } from './services/localBrainService';
 
 export default function App() {
     const [messages, setMessages] = useState([]);
+    const messagesRef = useRef([]);
+    const abortControllerRef = useRef(null);
+
+    // Keep messagesRef synced for synchronous access in handleUserInput
+    useEffect(() => {
+        messagesRef.current = messages;
+    }, [messages]);
+
     const [isListening, setIsListening] = useState(false);
     const [status, setStatus] = useState('idle');
     const [emotion, setEmotion] = useState('neutral');
@@ -50,6 +59,11 @@ export default function App() {
 
             requestNotificationPermission();
 
+            // Pre-load local brain if using LOCAL_BRAIN mode
+            if (key && key.trim().toUpperCase() === 'LOCAL_BRAIN') {
+                warmModel();
+            }
+
             // Daily check-in greeting
             const hour = new Date().getHours();
             let greeting;
@@ -85,10 +99,32 @@ export default function App() {
         init();
     }, []);
 
+    // RAF-batched streaming ref to avoid per-token re-renders
+    const streamBufferRef = useRef({ text: '', rafId: null, msgId: null });
+
     // Process user input
     const handleUserInput = useCallback(
         async (text) => {
             if (!text.trim()) return;
+
+            // Filter out common STT/Whisper silence hallucinations
+            const lowerText = text.toLowerCase();
+            if (lowerText.includes('ignore silence') ||
+                lowerText.includes('8-billion') ||
+                lowerText === 'subtitles by') {
+                console.log('Ignored STT hallucination:', text);
+                return;
+            }
+
+            // Immediately interrupt any ongoing speech or generation
+            stopSpeaking();
+            if (abortControllerRef.current) {
+                abortControllerRef.current.abort();
+            }
+
+            // Create a new abort controller for this request
+            abortControllerRef.current = new AbortController();
+            const currentSignal = abortControllerRef.current.signal;
 
             setIsListening(false);
             recognitionRef.current?.stop();
@@ -100,6 +136,14 @@ export default function App() {
             setEmotion(moodToEmotion(detectedMood));
 
             const userMsg = { role: 'user', content: text, timestamp: Date.now() };
+
+            // Read safely from our synchronized ref
+            const currentMessages = messagesRef.current;
+            const allMessages = [...currentMessages, userMsg].map((m) => ({
+                role: m.role,
+                content: m.content,
+            }));
+
             setMessages((prev) => [...prev, userMsg]);
 
             setStatus('thinking');
@@ -107,11 +151,6 @@ export default function App() {
             setIsTyping(true);
 
             try {
-                const allMessages = [...messages, userMsg].map((m) => ({
-                    role: m.role,
-                    content: m.content,
-                }));
-
                 if (sentiment.needsCheckIn) {
                     allMessages.push({
                         role: 'system',
@@ -119,16 +158,52 @@ export default function App() {
                     });
                 }
 
-                const response = await sendMessage(allMessages, apiKeyRef.current);
+                // Setup streaming buffer
+                const assistantMsgId = Date.now() + 1;
+                streamBufferRef.current = { text: '', rafId: null, msgId: assistantMsgId };
+
+                const response = await sendMessage(allMessages, apiKeyRef.current, (token) => {
+                    const buf = streamBufferRef.current;
+                    buf.text += token;
+                    setIsTyping(false);
+                    setStatus('thinking');
+                    setStatusText('Thinking...');
+
+                    // Batch DOM updates to animation frames (~60fps)
+                    if (!buf.rafId) {
+                        buf.rafId = requestAnimationFrame(() => {
+                            buf.rafId = null;
+                            const snapshot = buf.text;
+                            setMessages(prev => {
+                                const existing = prev.find(m => m.id === buf.msgId);
+                                if (existing) {
+                                    return prev.map(m => m.id === buf.msgId ? { ...m, content: snapshot } : m);
+                                } else {
+                                    return [...prev, {
+                                        id: buf.msgId,
+                                        role: 'assistant',
+                                        content: snapshot,
+                                        timestamp: Date.now(),
+                                    }];
+                                }
+                            });
+                        });
+                    }
+                }, currentSignal);
+
+                // Flush any remaining buffered content
+                if (streamBufferRef.current.rafId) {
+                    cancelAnimationFrame(streamBufferRef.current.rafId);
+                }
+                setMessages(prev => {
+                    const existing = prev.find(m => m.id === assistantMsgId);
+                    if (existing) {
+                        return prev.map(m => m.id === assistantMsgId ? { ...m, content: response } : m);
+                    }
+                    return prev;
+                });
 
                 extractAndSaveFacts(text, response);
-
-                const assistantMsg = {
-                    role: 'assistant',
-                    content: response,
-                    timestamp: Date.now(),
-                };
-                setMessages((prev) => [...prev, assistantMsg]);
                 setIsTyping(false);
 
                 setStatus('speaking');
@@ -136,32 +211,49 @@ export default function App() {
                 setEmotion(sentiment.needsCheckIn ? 'concerned' : moodToEmotion(detectedMood));
 
                 const savedRate = parseFloat(localStorage.getItem('miya-rate') || '1.0');
-                const savedVoice = localStorage.getItem('miya-voice') || '';
-                await speak(response, {
-                    voice: savedVoice,
+                // Always use the latest selected voice from UI
+                const currentVoice = localStorage.getItem('miya-voice') || '';
+
+                speak(response, {
+                    voice: currentVoice,
                     rate: savedRate,
                     onStart: () => setStatus('speaking'),
                     onEnd: () => {
-                        setStatus('idle');
-                        setStatusText('Ready');
-                        setTimeout(() => setEmotion('neutral'), 2000);
+                        // Check if we were interrupted before settling back to idle
+                        if (!currentSignal.aborted) {
+                            setStatus('idle');
+                            setStatusText('Ready');
+                            setTimeout(() => setEmotion('neutral'), 2000);
+                        }
                     },
                 });
             } catch (err) {
+                if (err.name === 'AbortError') {
+                    console.log('Generation aborted by user interruption.');
+                    // The new handleUserInput will safely take over UI state
+                    return;
+                }
+
                 console.error('AI Error:', err);
-                setIsTyping(false);
-                const errorMsg = {
-                    role: 'assistant',
-                    content: `I'm having trouble: ${err.message}`,
-                    timestamp: Date.now(),
-                };
-                setMessages((prev) => [...prev, errorMsg]);
-                setStatus('idle');
-                setStatusText('Error');
-                setEmotion('concerned');
+                if (!currentSignal.aborted) {
+                    setIsTyping(false);
+                    const errorMsg = {
+                        role: 'assistant',
+                        content: `I'm having trouble: ${err.message}`,
+                        timestamp: Date.now(),
+                    };
+                    setMessages((prev) => [...prev, errorMsg]);
+                    setStatus('idle');
+                    setStatusText('Error');
+                    setEmotion('concerned');
+                }
+            } finally {
+                if (!currentSignal.aborted) {
+                    setIsTyping(false);
+                }
             }
         },
-        [messages]
+        [] // No dependency on messages — uses functional updater
     );
 
     // Keep latest callbacks in a ref to avoid stale closures in event listeners
@@ -186,7 +278,7 @@ export default function App() {
                 setIsListening(false);
             }
         };
-    });
+    }, [handleUserInput]);
 
     // Toggle microphone (Push to Talk / Click to Stop)
     const toggleMic = useCallback(() => {
@@ -214,7 +306,7 @@ export default function App() {
             setStatus('listening');
             setStatusText('Listening... (Click again to send)');
         }
-    }, [isListening, handleUserInput, status]);
+    }, [isListening]);
 
     // Keyboard shortcuts
     useEffect(() => {
