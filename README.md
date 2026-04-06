@@ -35,12 +35,46 @@ Deployment Pipeline:
   LoRA Adapter → llama.cpp GGUF Converter → Ollama Modelfile → Local Model
 ```
 
-## 🚀 Quick Start
+## 🚀 Quick Start & Usage
 
 ### Prerequisites
 - [Ollama](https://ollama.com) installed
-- [Python 3.10+](https://python.org)
-- Git
+
+### 1. Download the Models
+The fine-tuned LoRA adapters (and corresponding base model logic) can be downloaded to run Miya-Omega locally.
+- **Miya-Omega 8B (Lite)**: `[Link to Model / Google Drive / HuggingFace]`
+- **Miya-Omega 70B (Full)**: `[Link to Model / Google Drive / HuggingFace]`
+
+*Note: Once you upload your models to a cloud host, insert the download links above.*
+
+Download and place the `.gguf` and `.safetensors` files in designated local directories (e.g., `C:\MiyaOmega` and `C:\MiyaOmega8B`).
+
+### 2. Setup with Ollama
+To integrate the models locally, open your terminal and run the following:
+
+**For the 8B Lite Model:**
+```bash
+echo "FROM C:\MiyaOmega8B\miya_omega_8b_lite.gguf
+ADAPTER C:\MiyaOmega8B\MiyaOmega8B-F32-LoRA.gguf" > Modelfile
+ollama create miya-omega-8b -f Modelfile
+ollama run miya-omega-8b
+```
+
+**For the 70B Full Model:**
+*(Requires 40GB+ RAM/VRAM to run)*
+```bash
+ollama pull deepseek-r1:70b
+echo "FROM deepseek-r1:70b
+ADAPTER C:\MiyaOmega\MiyaOmega-F32-LoRA.gguf" > Modelfile
+ollama create miya-omega-70b -f Modelfile
+ollama run miya-omega-70b
+```
+
+---
+
+## 🛠️ Train It Yourself (Optional)
+
+*If you prefer to train the model from scratch using your own dataset:*
 
 ### 1. Clone the Repository
 ```bash
@@ -65,20 +99,6 @@ curl -o base_config/config.json https://huggingface.co/deepseek-ai/DeepSeek-R1-D
 
 # Convert
 python llama.cpp/convert_lora_to_gguf.py --base base_config ./adapter_output
-```
-
-### 4. Deploy with Ollama
-```bash
-# Pull base model
-ollama pull deepseek-r1:70b
-
-# Create Modelfile
-echo "FROM deepseek-r1:70b
-ADAPTER ./MiyaOmega-F32-LoRA.gguf" > Modelfile
-
-# Build & Run
-ollama create miya-omega -f Modelfile
-ollama run miya-omega
 ```
 
 ## 📁 Project Structure
