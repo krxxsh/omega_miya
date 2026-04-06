@@ -23,7 +23,7 @@ Miya-Omega is a **custom fine-tuned AI model** built on top of DeepSeek-R1. It f
 | Variant | Base Model | RAM Needed | Status |
 |---------|-----------|------------|--------|
 | Miya-Omega 70B | DeepSeek-R1-Distill-Llama-70B | 40+ GB | ✅ Trained |
-| Miya-Omega 8B | DeepSeek-R1-Distill-Llama-8B | 5 GB | 🔜 Coming |
+| Miya-Omega 8B | DeepSeek-R1-Distill-Llama-8B | 5 GB | ✅ Trained |
 
 ## 🏗️ Architecture
 
